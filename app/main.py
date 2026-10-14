@@ -14,6 +14,8 @@ request_id_context: ContextVar[str | None] = ContextVar(
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 from google import genai
 
@@ -53,6 +55,61 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+# --------------------------------------------------
+# GLOBAL EXCEPTION HANDLERS
+# --------------------------------------------------
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    request_id = getattr(request.state, "request_id", str(uuid4()))
+
+    logger.warning(
+        "Request validation failed request_id=%s path=%s",
+        request_id,
+        request.url.path,
+    )
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Request validation failed.",
+            "errors": [
+                {
+                    "location": [str(part) for part in error["loc"]],
+                    "message": error["msg"],
+                    "type": error["type"],
+                }
+                for error in exc.errors()
+            ],
+            "request_id": request_id,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unexpected_exception_handler(
+    request: Request,
+    exc: Exception,
+):
+    request_id = getattr(request.state, "request_id", str(uuid4()))
+
+    logger.exception(
+        "Unhandled exception request_id=%s path=%s",
+        request_id,
+        request.url.path,
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "An unexpected internal server error occurred.",
+            "request_id": request_id,
+        },
+    )
 
 
 # --------------------------------------------------

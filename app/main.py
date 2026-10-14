@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -121,7 +120,7 @@ class ValidationRequest(BaseModel):
 class AgenticExtractionRequest(BaseModel):
     document_id: str
     fields: list[str] = Field(min_length=1, max_length=30)
-    max_retries: int = Field(default=2, ge=0, le=3)
+    max_retries: int = Field(default=1, ge=0, le=3)
 
 
 # --------------------------------------------------
@@ -149,6 +148,7 @@ def get_document_text(document_id: str) -> str:
     return "\n".join(chunk["text"] for chunk in chunks)
 
 
+
 def get_gemini_response(prompt: str) -> str:
     """Call Gemini with limited retries and structured event logging."""
 
@@ -164,7 +164,9 @@ def get_gemini_response(prompt: str) -> str:
     error_type = None
 
     max_attempts = 3
-    retryable_status_codes = {429, 500, 502, 503, 504}
+
+    # Retry temporary server errors, but not quota errors.
+    retryable_status_codes = {500, 502, 503, 504}
 
     try:
         for attempt in range(1, max_attempts + 1):
@@ -177,6 +179,7 @@ def get_gemini_response(prompt: str) -> str:
                 answer = response.text
 
                 if not answer or not answer.strip():
+                    error_type = "EmptyModelResponse"
                     raise HTTPException(
                         status_code=502,
                         detail="The AI model returned an empty response.",
@@ -198,6 +201,25 @@ def get_gemini_response(prompt: str) -> str:
                     status_code = int(status_code)
                 except (TypeError, ValueError):
                     status_code = None
+
+                # Stop immediately when Gemini reports a quota/rate limit.
+                if status_code == 429:
+                    error_type = "GeminiQuotaOrRateLimit"
+
+                    logger.warning(
+                        "Gemini request %s hit a quota/rate limit. "
+                        "Application retries stopped.",
+                        request_id,
+                    )
+
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Gemini API quota or rate limit reached. "
+                            "Check your Google AI Studio quota or wait "
+                            "until capacity becomes available."
+                        ),
+                    ) from exc
 
                 should_retry = (
                     status_code in retryable_status_codes
@@ -251,8 +273,6 @@ def get_gemini_response(prompt: str) -> str:
         status_code=502,
         detail="The AI service could not complete the request.",
     )
-
-
 def clean_json_response(raw_response: str) -> str:
     """Remove optional Markdown code fences around JSON."""
 
@@ -709,6 +729,7 @@ def validate_extraction(request: ValidationRequest):
 # 10. AGENTIC EXTRACTION WORKFLOW
 # --------------------------------------------------
 
+
 @app.post("/agentic-extract")
 def agentic_extract(request: AgenticExtractionRequest):
     """Extract, validate, retry, and flag unresolved fields."""
@@ -784,6 +805,7 @@ JSON:
             data=extracted_data,
             required_fields=fields,
         )
+
         if not validation["is_valid"]:
             log_llm_event(
                 request_id=request_id_context.get() or str(uuid4()),
@@ -806,20 +828,60 @@ JSON:
 
     human_review_required = not validation["is_valid"]
 
+    if human_review_required:
+        status = "human_review"
+        message = (
+            "Some fields remain unresolved. Human review is required."
+        )
+    else:
+        status = "success"
+        message = "Extraction completed successfully."
+            # Build source references from stored document chunks.
+    document_chunks = get_document_chunks(request.document_id)
+
+    sources = [
+        {
+            "filename": chunk.get("filename"),
+            "chunk_index": chunk.get("chunk_index"),
+        }
+        for chunk in document_chunks
+    ]
+
+    # Calculate field completeness, not factual accuracy.
+    completed_fields = sum(
+        1
+        for field in fields
+        if extracted_data.get(field) is not None
+        and (
+            not isinstance(extracted_data.get(field), str)
+            or bool(extracted_data[field].strip())
+        )
+    )
+
+    confidence = round(completed_fields / len(fields), 2)
+
+    
     return {
-        "status": "success" if not human_review_required else "human_review",
+        # Required output fields from the task PDF
+        "status": status,
+        "data": extracted_data,
+        "sources": sources,
+        "validation_errors": validation["missing_fields"],
+        "confidence": confidence,
+        "message": message,
+
+        # Compatibility field used by existing tests
+        "extracted_data": extracted_data,
+
+        # Additional debugging information
         "document_id": request.document_id,
         "extraction_method": extraction_method,
         "attempts_used": attempt_number,
         "max_retries": request.max_retries,
-        "extracted_data": extracted_data,
-        "validation": validation,
         "human_review_required": human_review_required,
         "human_review_fields": validation["missing_fields"],
+        "validation": validation,
         "attempt_history": attempts,
-        "message": (
-            "Extraction completed successfully."
-            if not human_review_required
-            else "Some fields remain unresolved. Human review is required."
-        ),
     }
+
+
